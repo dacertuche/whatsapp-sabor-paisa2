@@ -10,67 +10,84 @@ app.use(bodyParser.json());
 let sock;
 let currentQR = null;
 let isConnected = false;
-let waitingForQR = false;
-
+let isConnecting = false;
 
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    if (isConnecting) {
+        console.log('⚠️ Ya hay una conexión en proceso...');
+        return;
+    }
     
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true
-    });
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
+    isConnecting = true;
+    
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
         
-        if (qr) {
-            waitingForQR = true;
+        sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false // ❗ Cambiamos a false para evitar spam en logs
+        });
 
-            console.log('📱 QR generado. Ve a /qr para escanearlo');
-            qrcode.generate(qr, { small: true });
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect, qr } = update;
             
-            QRCode.toDataURL(qr, (err, url) => {
-                if (!err) {
-                    currentQR = url;
-                }
-            });
-        }
-        
-        if (connection === 'close') {
-            isConnected = false;
-
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-
-            // ⚠️ NO reconectar si está esperando QR (401)
-            const shouldReconnect =
-            !waitingForQR &&
-            statusCode !== DisconnectReason.loggedOut;
-
-
-            console.log('Conexión cerrada. Reconectando...', shouldReconnect);
-
-            if (shouldReconnect) {
-                connectToWhatsApp();
+            if (qr) {
+                console.log('📱 QR generado. Disponible en /qr');
+                
+                // Generar QR para mostrar por HTTP
+                QRCode.toDataURL(qr, (err, url) => {
+                    if (!err) {
+                        currentQR = url;
+                        console.log('✅ QR listo para escanear');
+                    }
+                });
             }
+            
+            if (connection === 'close') {
+                isConnected = false;
+                isConnecting = false;
+                
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                
+                console.log('❌ Conexión cerrada:', statusCode);
+                
+                if (shouldReconnect) {
+                    console.log('🔄 Reconectando en 5 segundos...');
+                    // ⚠️ Esperamos 5 segundos antes de reconectar
+                    setTimeout(() => {
+                        connectToWhatsApp();
+                    }, 5000);
+                } else {
+                    console.log('⚠️ Sesión cerrada. Ve a /qr para reconectar');
+                    currentQR = null;
+                }
+            } else if (connection === 'open') {
+                console.log('✅ WhatsApp conectado exitosamente');
+                isConnected = true;
+                isConnecting = false;
+                currentQR = null;
+            }
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('messages.upsert', async (m) => {
+            const msg = m.messages[0];
+            if (!msg.key.fromMe && m.type === 'notify') {
+                console.log('📩 Mensaje recibido:', msg.message?.conversation || 'Media/Other');
+            }
+        });
         
-        } else if (connection === 'open') {
-            console.log('✅ Conectado a WhatsApp');
-            isConnected = true;
-            currentQR = null;
-            waitingForQR = false;
-
-        }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.key.fromMe && m.type === 'notify') {
-            console.log('📩 Mensaje recibido:', msg.message?.conversation);
-        }
-    });
+    } catch (error) {
+        console.error('❌ Error en connectToWhatsApp:', error);
+        isConnecting = false;
+        
+        // Reintentar después de 10 segundos si hay error
+        setTimeout(() => {
+            connectToWhatsApp();
+        }, 10000);
+    }
 }
 
 app.get('/qr', (req, res) => {
@@ -82,12 +99,12 @@ app.get('/qr', (req, res) => {
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
                     <title>WhatsApp Conectado</title>
                 </head>
-                <body style="text-align: center; padding: 50px; font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; min-height: 100vh;">
-                    <h1>✅ WhatsApp ya está conectado</h1>
-                    <p>No es necesario escanear ningún QR.</p>
-                    <p style="margin-top: 30px;">
-                        <a href="/" style="color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 10px 20px; border-radius: 5px;">Ver estado</a>
-                    </p>
+                <body style="text-align: center; padding: 50px; font-family: Arial; background: linear-gradient(135deg, #25D366 0%, #128C7E 100%); color: white; min-height: 100vh;">
+                    <h1>✅ WhatsApp Conectado</h1>
+                    <p style="font-size: 1.2em;">El bot está funcionando correctamente</p>
+                    <div style="margin-top: 30px;">
+                        <a href="/" style="color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 15px 30px; border-radius: 8px; display: inline-block;">Ver estado del servidor</a>
+                    </div>
                 </body>
             </html>
         `);
@@ -102,12 +119,15 @@ app.get('/qr', (req, res) => {
                     <title>Esperando QR</title>
                 </head>
                 <body style="text-align: center; padding: 50px; font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; min-height: 100vh;">
-                    <h1>⏳ Esperando QR...</h1>
-                    <p>El servidor se está inicializando. Recarga esta página en unos segundos.</p>
+                    <h1>⏳ Generando código QR...</h1>
+                    <p>El servidor se está inicializando.</p>
+                    <p>Esta página se recargará automáticamente.</p>
                     <div style="margin-top: 30px;">
-                        <div style="display: inline-block; width: 50px; height: 50px; border: 5px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                        <div style="display: inline-block; width: 60px; height: 60px; border: 6px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 1s linear infinite;"></div>
                     </div>
-                    <script>setTimeout(() => location.reload(), 3000);</script>
+                    <script>
+                        setTimeout(() => location.reload(), 3000);
+                    </script>
                     <style>
                         @keyframes spin {
                             to { transform: rotate(360deg); }
@@ -123,26 +143,38 @@ app.get('/qr', (req, res) => {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Conectar WhatsApp</title>
+                <title>Conectar WhatsApp - Sabor Paisa Express</title>
             </head>
-            <body style="text-align: center; padding: 50px; font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; min-height: 100vh;">
-                <h1>📱 Escanea este QR con WhatsApp</h1>
-                <div style="background: white; display: inline-block; padding: 30px; border-radius: 20px; margin: 30px 0; box-shadow: 0 10px 40px rgba(0,0,0,0.3);">
-                    <img src="${currentQR}" style="max-width: 300px; display: block;"/>
+            <body style="margin: 0; padding: 50px; font-family: 'Segoe UI', Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; min-height: 100vh; box-sizing: border-box;">
+                <div style="max-width: 600px; margin: 0 auto;">
+                    <h1 style="font-size: 2.5em; margin-bottom: 10px;">📱 Conectar WhatsApp</h1>
+                    <p style="font-size: 1.1em; opacity: 0.9;">Sabor Paisa Express</p>
+                    
+                    <div style="background: white; padding: 40px; border-radius: 20px; margin: 40px 0; box-shadow: 0 20px 60px rgba(0,0,0,0.3);">
+                        <img src="${currentQR}" style="width: 100%; max-width: 350px; display: block; margin: 0 auto;"/>
+                    </div>
+                    
+                    <div style="background: rgba(255,255,255,0.15); padding: 30px; border-radius: 15px; backdrop-filter: blur(10px);">
+                        <h3 style="margin-top: 0; font-size: 1.4em;">📋 Cómo conectar:</h3>
+                        <ol style="text-align: left; line-height: 2.2; font-size: 1.05em; padding-left: 20px;">
+                            <li>Abre <strong>WhatsApp</strong> en tu teléfono</li>
+                            <li>Toca <strong>⋮</strong> o <strong>Configuración</strong></li>
+                            <li>Selecciona <strong>Dispositivos vinculados</strong></li>
+                            <li>Toca <strong>"Vincular dispositivo"</strong></li>
+                            <li><strong>Escanea este código QR</strong> ☝️</li>
+                        </ol>
+                    </div>
+                    
+                    <p style="margin-top: 40px; opacity: 0.7; font-size: 0.9em;">
+                        ⚠️ Este QR expira en 20 segundos<br>
+                        La página se recargará automáticamente cada 15 segundos
+                    </p>
                 </div>
-                <div style="max-width: 500px; margin: 0 auto; background: rgba(255,255,255,0.1); padding: 30px; border-radius: 15px;">
-                    <h3 style="margin-bottom: 20px;">📋 Instrucciones:</h3>
-                    <ol style="text-align: left; line-height: 2;">
-                        <li>Abre <strong>WhatsApp</strong> en tu celular</li>
-                        <li>Ve a <strong>Configuración → Dispositivos vinculados</strong></li>
-                        <li>Toca <strong>"Vincular dispositivo"</strong></li>
-                        <li>Escanea este código QR</li>
-                    </ol>
-                </div>
-                <p style="margin-top: 30px; opacity: 0.8;">
-                    <small>Esta página se recargará automáticamente cada 10 segundos</small>
-                </p>
-                <script>setTimeout(() => location.reload(), 10000);</script>
+                
+                <script>
+                    // Recargar cada 15 segundos para obtener un nuevo QR
+                    setTimeout(() => location.reload(), 15000);
+                </script>
             </body>
         </html>
     `);
@@ -150,17 +182,25 @@ app.get('/qr', (req, res) => {
 
 app.get('/', (req, res) => {
     res.json({ 
+        success: true,
         status: 'online',
         whatsapp: isConnected ? 'connected' : 'disconnected',
-        message: isConnected ? 'WhatsApp conectado ✅' : 'WhatsApp desconectado. Ve a /qr para conectar 📱',
-        timestamp: new Date().toISOString()
+        connecting: isConnecting,
+        message: isConnected 
+            ? '✅ WhatsApp conectado y funcionando' 
+            : isConnecting 
+                ? '🔄 Conectando a WhatsApp...'
+                : '⚠️ WhatsApp desconectado. Ve a /qr para conectar',
+        timestamp: new Date().toISOString(),
+        qr_url: '/qr'
     });
 });
 
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'healthy',
-        uptime: process.uptime(),
+        uptime: Math.floor(process.uptime()),
+        whatsapp_connected: isConnected,
         timestamp: new Date().toISOString()
     });
 });
@@ -169,10 +209,18 @@ app.post('/send-message', async (req, res) => {
     try {
         const { phone, message } = req.body;
         
-        if (!sock || !isConnected) {
+        if (!phone || !message) {
             return res.status(400).json({ 
                 success: false,
-                error: 'WhatsApp no conectado. Ve a /qr para conectar' 
+                error: 'Faltan parámetros: phone y message son requeridos' 
+            });
+        }
+        
+        if (!sock || !isConnected) {
+            return res.status(503).json({ 
+                success: false,
+                error: 'WhatsApp no conectado. Ve a /qr para conectar',
+                qr_url: '/qr'
             });
         }
 
@@ -182,7 +230,8 @@ app.post('/send-message', async (req, res) => {
         res.json({ 
             success: true, 
             message: 'Mensaje enviado exitosamente',
-            to: phone 
+            to: phone,
+            timestamp: new Date().toISOString()
         });
     } catch (error) {
         console.error('❌ Error enviando mensaje:', error);
@@ -197,10 +246,18 @@ app.post('/send-to-group', async (req, res) => {
     try {
         const { groupId, message } = req.body;
         
-        if (!sock || !isConnected) {
+        if (!groupId || !message) {
             return res.status(400).json({ 
                 success: false,
-                error: 'WhatsApp no conectado. Ve a /qr para conectar' 
+                error: 'Faltan parámetros: groupId y message son requeridos' 
+            });
+        }
+        
+        if (!sock || !isConnected) {
+            return res.status(503).json({ 
+                success: false,
+                error: 'WhatsApp no conectado. Ve a /qr para conectar',
+                qr_url: '/qr'
             });
         }
 
@@ -209,7 +266,8 @@ app.post('/send-to-group', async (req, res) => {
         res.json({ 
             success: true, 
             message: 'Mensaje enviado al grupo exitosamente',
-            groupId: groupId 
+            groupId: groupId,
+            timestamp: new Date().toISOString()
         });
     } catch (error) {
         console.error('❌ Error enviando al grupo:', error);
@@ -223,9 +281,10 @@ app.post('/send-to-group', async (req, res) => {
 app.get('/groups', async (req, res) => {
     try {
         if (!sock || !isConnected) {
-            return res.status(400).json({ 
+            return res.status(503).json({ 
                 success: false,
-                error: 'WhatsApp no conectado. Ve a /qr primero' 
+                error: 'WhatsApp no conectado. Ve a /qr primero',
+                qr_url: '/qr'
             });
         }
 
@@ -233,7 +292,9 @@ app.get('/groups', async (req, res) => {
         const groupList = Object.values(groups).map(g => ({
             id: g.id,
             name: g.subject,
-            participants: g.participants.length
+            participants: g.participants.length,
+            creation: g.creation,
+            owner: g.owner
         }));
         
         res.json({
@@ -252,9 +313,15 @@ app.get('/groups', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 Servidor WhatsApp corriendo en puerto ${PORT}`);
-    console.log(`📱 Para conectar WhatsApp, ve a: /qr`);
-    console.log(`📊 Estado del servidor: /`);
-    console.log(`👥 Ver grupos: /groups`);
+    console.log('═══════════════════════════════════════════════════════');
+    console.log('🚀 Servidor WhatsApp - Sabor Paisa Express');
+    console.log('═══════════════════════════════════════════════════════');
+    console.log(`📡 Puerto: ${PORT}`);
+    console.log(`🌐 URL: https://whatsapp-sabor-paisa2.onrender.com`);
+    console.log(`📱 Conectar WhatsApp: https://whatsapp-sabor-paisa2.onrender.com/qr`);
+    console.log(`📊 Estado: https://whatsapp-sabor-paisa2.onrender.com/`);
+    console.log(`👥 Grupos: https://whatsapp-sabor-paisa2.onrender.com/groups`);
+    console.log('═══════════════════════════════════════════════════════');
+    console.log('🔄 Iniciando conexión a WhatsApp...');
     connectToWhatsApp();
 });
