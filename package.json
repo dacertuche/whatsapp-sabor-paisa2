@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Servidor WhatsApp para Sabor Paisa Express",
   "main": "whatsapp-server.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "node whatsapp-server.js"
   },
