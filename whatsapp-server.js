@@ -10,6 +10,8 @@ app.use(bodyParser.json());
 let sock;
 let currentQR = null;
 let isConnected = false;
+let waitingForQR = false;
+
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -23,6 +25,8 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
+            waitingForQR = true;
+
             console.log('📱 QR generado. Ve a /qr para escanearlo');
             qrcode.generate(qr, { small: true });
             
@@ -40,8 +44,9 @@ async function connectToWhatsApp() {
 
             // ⚠️ NO reconectar si está esperando QR (401)
             const shouldReconnect =
-                statusCode !== DisconnectReason.loggedOut &&
-                statusCode !== 401;
+            !waitingForQR &&
+            statusCode !== DisconnectReason.loggedOut;
+
 
             console.log('Conexión cerrada. Reconectando...', shouldReconnect);
 
@@ -53,6 +58,8 @@ async function connectToWhatsApp() {
             console.log('✅ Conectado a WhatsApp');
             isConnected = true;
             currentQR = null;
+            waitingForQR = false;
+
         }
     });
 
