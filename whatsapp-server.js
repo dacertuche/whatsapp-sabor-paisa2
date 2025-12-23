@@ -34,15 +34,16 @@ async function connectToWhatsApp() {
             logger,
             version,
             printQRInTerminal: false,
-            connectTimeoutMs: 60000, // 60 segundos de timeout
+            connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 30000,
-            // Configuración para evitar reconexiones agresivas
             retryRequestDelayMs: 250,
             maxMsgRetryCount: 5,
-            // Desactivar reconexión automática
             shouldIgnoreJid: jid => false,
-            syncFullHistory: false
+            syncFullHistory: false,
+            // 🔔 CONFIGURACIÓN CLAVE: No marcar como leído automáticamente
+            markOnlineOnConnect: false, // No aparecer "en línea"
+            emitOwnEvents: false, // No emitir eventos propios
         });
 
         sock.ev.on('connection.update', async (update) => {
@@ -68,24 +69,20 @@ async function connectToWhatsApp() {
                 
                 console.log('❌ Conexión cerrada. Status:', statusCode);
                 
-                // Limpiar estado
                 isConnecting = false;
                 
                 if (statusCode === DisconnectReason.loggedOut) {
                     console.log('🔓 Sesión cerrada. Escanea el QR nuevamente en /qr');
                     currentQR = null;
                     qrRetries = 0;
-                    // NO reconectar automáticamente, esperar escaneo manual
                     return;
                 }
                 
-                // Para códigos 405 (QR timeout) y similares
                 if (statusCode === 405 || statusCode === 428) {
                     if (qrRetries >= MAX_QR_RETRIES) {
                         console.log('⚠️  Demasiados intentos. Espera 2 minutos antes de reconectar.');
                         currentQR = null;
                         qrRetries = 0;
-                        // Esperar 2 minutos antes de permitir nueva conexión
                         setTimeout(() => {
                             console.log('🔄 Sistema listo para nueva conexión');
                         }, 120000);
@@ -100,7 +97,6 @@ async function connectToWhatsApp() {
                     return;
                 }
                 
-                // Para otros errores, esperar más tiempo
                 if (shouldReconnect) {
                     console.log('🔄 Reconectando en 30 segundos...');
                     setTimeout(() => {
@@ -113,6 +109,14 @@ async function connectToWhatsApp() {
                 isConnecting = false;
                 currentQR = null;
                 qrRetries = 0;
+                
+                // 🔔 Configurar presencia como "unavailable" para no bloquear notificaciones
+                try {
+                    await sock.sendPresenceUpdate('unavailable');
+                    console.log('🔕 Presencia configurada como "no disponible" - Las notificaciones llegarán a tu celular');
+                } catch (err) {
+                    console.error('⚠️  Error configurando presencia:', err.message);
+                }
             } else if (connection === 'connecting') {
                 console.log('🔌 Conectando a WhatsApp...');
             }
@@ -120,21 +124,49 @@ async function connectToWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
+        // 🔔 CONFIGURACIÓN CRÍTICA: NO marcar mensajes como leídos
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
+            
+            // Solo procesar mensajes entrantes (no los propios)
             if (!msg.key.fromMe && m.type === 'notify') {
                 const text = msg.message?.conversation || 
                             msg.message?.extendedTextMessage?.text || 
                             'Media/Other';
-                console.log('📩 Mensaje recibido:', text);
+                
+                const from = msg.key.remoteJid;
+                console.log('📩 Mensaje recibido de:', from);
+                console.log('💬 Contenido:', text);
+                
+                // ❌ NO MARCAR COMO LEÍDO - Comentado para que lleguen notificaciones
+                // await sock.readMessages([msg.key]);
+                
+                // 🔔 Mantener presencia como "unavailable"
+                try {
+                    await sock.sendPresenceUpdate('unavailable');
+                } catch (err) {
+                    // Ignorar errores de presencia
+                }
+                
+                console.log('🔔 Mensaje NO marcado como leído - Recibirás notificación en tu celular');
             }
         });
+        
+        // 🔔 Mantener presencia como "unavailable" periódicamente
+        setInterval(async () => {
+            if (isConnected && sock) {
+                try {
+                    await sock.sendPresenceUpdate('unavailable');
+                } catch (err) {
+                    // Ignorar errores silenciosamente
+                }
+            }
+        }, 60000); // Cada 60 segundos
         
     } catch (error) {
         console.error('❌ Error en connectToWhatsApp:', error.message);
         isConnecting = false;
         
-        // Reintentar después de 30 segundos en caso de error crítico
         console.log('🔄 Reintentando en 30 segundos...');
         setTimeout(() => {
             connectToWhatsApp();
@@ -155,6 +187,10 @@ app.get('/qr', (req, res) => {
                 <body style="text-align: center; padding: 50px; font-family: Arial; background: linear-gradient(135deg, #25D366 0%, #128C7E 100%); color: white; min-height: 100vh;">
                     <h1>✅ WhatsApp Conectado</h1>
                     <p style="font-size: 1.2em;">El bot está funcionando correctamente</p>
+                    <div style="background: rgba(255,255,255,0.15); padding: 20px; border-radius: 10px; margin: 30px auto; max-width: 500px;">
+                        <h3>🔔 Notificaciones Activas</h3>
+                        <p>Los mensajes seguirán llegando como notificación a tu celular porque el bot está configurado como "no disponible"</p>
+                    </div>
                     <div style="margin-top: 30px;">
                         <a href="/" style="color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 15px 30px; border-radius: 8px; display: inline-block;">Ver estado del servidor</a>
                     </div>
@@ -164,7 +200,6 @@ app.get('/qr', (req, res) => {
     }
     
     if (!currentQR && !isConnecting) {
-        // Iniciar nueva conexión si no hay ninguna en proceso
         console.log('🚀 Iniciando nueva conexión desde /qr');
         connectToWhatsApp();
     }
@@ -226,6 +261,11 @@ app.get('/qr', (req, res) => {
                         </ol>
                     </div>
                     
+                    <div style="margin-top: 30px; padding: 20px; background: rgba(0,255,0,0.2); border-radius: 10px; border: 2px solid rgba(255,255,255,0.3);">
+                        <p style="margin: 0; font-size: 1.1em; font-weight: bold;">🔔 NOTIFICACIONES ACTIVAS</p>
+                        <p style="margin: 10px 0 0 0;">Este bot está configurado para NO interferir con tus notificaciones. Seguirás recibiendo alertas en tu celular de todos los mensajes.</p>
+                    </div>
+                    
                     <div style="margin-top: 30px; padding: 20px; background: rgba(255,0,0,0.2); border-radius: 10px; border: 2px solid rgba(255,255,255,0.3);">
                         <p style="margin: 0; font-size: 1.1em; font-weight: bold;">⚠️ IMPORTANTE</p>
                         <p style="margin: 10px 0 0 0;">Este QR expira en 60 segundos<br>
@@ -244,7 +284,6 @@ app.get('/qr', (req, res) => {
     `);
 });
 
-// Endpoint para forzar reconexión manual
 app.post('/reconnect', (req, res) => {
     if (isConnecting) {
         return res.json({ 
@@ -278,8 +317,9 @@ app.get('/', (req, res) => {
         whatsapp: isConnected ? 'connected' : 'disconnected',
         connecting: isConnecting,
         qr_retries: qrRetries,
+        notifications_enabled: true,
         message: isConnected 
-            ? '✅ WhatsApp conectado y funcionando' 
+            ? '✅ WhatsApp conectado - Notificaciones activas en tu celular' 
             : isConnecting 
                 ? '🔄 Conectando a WhatsApp... Ve a /qr'
                 : '⚠️ WhatsApp desconectado. Ve a /qr para conectar',
@@ -295,6 +335,7 @@ app.get('/health', (req, res) => {
         uptime: Math.floor(process.uptime()),
         whatsapp_connected: isConnected,
         whatsapp_connecting: isConnecting,
+        notifications_enabled: true,
         timestamp: new Date().toISOString()
     });
 });
@@ -320,6 +361,9 @@ app.post('/send-message', async (req, res) => {
 
         const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
         await sock.sendMessage(jid, { text: message });
+        
+        // Volver a estado "unavailable" después de enviar
+        await sock.sendPresenceUpdate('unavailable');
         
         res.json({ 
             success: true, 
@@ -356,6 +400,9 @@ app.post('/send-to-group', async (req, res) => {
         }
 
         await sock.sendMessage(groupId, { text: message });
+        
+        // Volver a estado "unavailable" después de enviar
+        await sock.sendPresenceUpdate('unavailable');
         
         res.json({ 
             success: true, 
@@ -416,6 +463,7 @@ app.listen(PORT, () => {
     console.log(`📊 Estado: https://whatsapp-sabor-paisa2.onrender.com/`);
     console.log(`👥 Grupos: https://whatsapp-sabor-paisa2.onrender.com/groups`);
     console.log('═══════════════════════════════════════════════════════');
+    console.log('🔔 NOTIFICACIONES ACTIVADAS - Los mensajes llegarán a tu celular');
     console.log('⏸️  Esperando solicitud manual en /qr para conectar');
     console.log('💡 No se conectará automáticamente al iniciar');
 });
