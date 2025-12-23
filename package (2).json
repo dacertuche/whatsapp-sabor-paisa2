@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp-server",
+  "version": "1.0.0",
+  "description": "Servidor WhatsApp para Sabor Paisa",
+  "main": "whatsapp-server.js",
+  "scripts": {
+    "start": "node whatsapp-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "@whiskeysockets/baileys": "^6.5.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
