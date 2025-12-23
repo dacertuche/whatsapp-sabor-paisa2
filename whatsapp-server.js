@@ -1,8 +1,8 @@
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import express from 'express';
 import bodyParser from 'body-parser';
-import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
+import pino from 'pino';
 
 const app = express();
 app.use(bodyParser.json());
@@ -11,10 +11,15 @@ let sock;
 let currentQR = null;
 let isConnected = false;
 let isConnecting = false;
+let qrRetries = 0;
+const MAX_QR_RETRIES = 3;
+
+// Logger silencioso para evitar spam
+const logger = pino({ level: 'silent' });
 
 async function connectToWhatsApp() {
     if (isConnecting) {
-        console.log('⚠️ Ya hay una conexión en proceso...');
+        console.log('⚠️  Ya hay una conexión en proceso...');
         return;
     }
     
@@ -22,51 +27,94 @@ async function connectToWhatsApp() {
     
     try {
         const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+        const { version } = await fetchLatestBaileysVersion();
         
         sock = makeWASocket({
             auth: state,
-            printQRInTerminal: false // ❗ Cambiamos a false para evitar spam en logs
+            logger,
+            version,
+            printQRInTerminal: false,
+            connectTimeoutMs: 60000, // 60 segundos de timeout
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
+            // Configuración para evitar reconexiones agresivas
+            retryRequestDelayMs: 250,
+            maxMsgRetryCount: 5,
+            // Desactivar reconexión automática
+            shouldIgnoreJid: jid => false,
+            syncFullHistory: false
         });
 
-        sock.ev.on('connection.update', (update) => {
+        sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
-                console.log('📱 QR generado. Disponible en /qr');
+                qrRetries++;
+                console.log(`📱 QR generado (${qrRetries}/${MAX_QR_RETRIES}). Disponible en /qr`);
                 
-                // Generar QR para mostrar por HTTP
-                QRCode.toDataURL(qr, (err, url) => {
-                    if (!err) {
-                        currentQR = url;
-                        console.log('✅ QR listo para escanear');
-                    }
-                });
+                try {
+                    const qrDataUrl = await QRCode.toDataURL(qr);
+                    currentQR = qrDataUrl;
+                    console.log('✅ QR listo para escanear - Tienes 60 segundos');
+                } catch (err) {
+                    console.error('❌ Error generando QR:', err);
+                }
             }
             
             if (connection === 'close') {
                 isConnected = false;
-                isConnecting = false;
-                
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 
-                console.log('❌ Conexión cerrada:', statusCode);
+                console.log('❌ Conexión cerrada. Status:', statusCode);
                 
-                if (shouldReconnect) {
-                    console.log('🔄 Reconectando en 5 segundos...');
-                    // ⚠️ Esperamos 5 segundos antes de reconectar
+                // Limpiar estado
+                isConnecting = false;
+                
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log('🔓 Sesión cerrada. Escanea el QR nuevamente en /qr');
+                    currentQR = null;
+                    qrRetries = 0;
+                    // NO reconectar automáticamente, esperar escaneo manual
+                    return;
+                }
+                
+                // Para códigos 405 (QR timeout) y similares
+                if (statusCode === 405 || statusCode === 428) {
+                    if (qrRetries >= MAX_QR_RETRIES) {
+                        console.log('⚠️  Demasiados intentos. Espera 2 minutos antes de reconectar.');
+                        currentQR = null;
+                        qrRetries = 0;
+                        // Esperar 2 minutos antes de permitir nueva conexión
+                        setTimeout(() => {
+                            console.log('🔄 Sistema listo para nueva conexión');
+                        }, 120000);
+                        return;
+                    }
+                    
+                    console.log('🔄 QR expirado. Generando nuevo QR en 10 segundos...');
+                    currentQR = null;
                     setTimeout(() => {
                         connectToWhatsApp();
-                    }, 5000);
-                } else {
-                    console.log('⚠️ Sesión cerrada. Ve a /qr para reconectar');
-                    currentQR = null;
+                    }, 10000);
+                    return;
+                }
+                
+                // Para otros errores, esperar más tiempo
+                if (shouldReconnect) {
+                    console.log('🔄 Reconectando en 30 segundos...');
+                    setTimeout(() => {
+                        connectToWhatsApp();
+                    }, 30000);
                 }
             } else if (connection === 'open') {
                 console.log('✅ WhatsApp conectado exitosamente');
                 isConnected = true;
                 isConnecting = false;
                 currentQR = null;
+                qrRetries = 0;
+            } else if (connection === 'connecting') {
+                console.log('🔌 Conectando a WhatsApp...');
             }
         });
 
@@ -75,24 +123,29 @@ async function connectToWhatsApp() {
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.key.fromMe && m.type === 'notify') {
-                console.log('📩 Mensaje recibido:', msg.message?.conversation || 'Media/Other');
+                const text = msg.message?.conversation || 
+                            msg.message?.extendedTextMessage?.text || 
+                            'Media/Other';
+                console.log('📩 Mensaje recibido:', text);
             }
         });
         
     } catch (error) {
-        console.error('❌ Error en connectToWhatsApp:', error);
+        console.error('❌ Error en connectToWhatsApp:', error.message);
         isConnecting = false;
         
-        // Reintentar después de 10 segundos si hay error
+        // Reintentar después de 30 segundos en caso de error crítico
+        console.log('🔄 Reintentando en 30 segundos...');
         setTimeout(() => {
             connectToWhatsApp();
-        }, 10000);
+        }, 30000);
     }
 }
 
 app.get('/qr', (req, res) => {
     if (isConnected) {
         return res.send(`
+            <!DOCTYPE html>
             <html>
                 <head>
                     <meta charset="UTF-8">
@@ -110,8 +163,15 @@ app.get('/qr', (req, res) => {
         `);
     }
     
+    if (!currentQR && !isConnecting) {
+        // Iniciar nueva conexión si no hay ninguna en proceso
+        console.log('🚀 Iniciando nueva conexión desde /qr');
+        connectToWhatsApp();
+    }
+    
     if (!currentQR) {
         return res.send(`
+            <!DOCTYPE html>
             <html>
                 <head>
                     <meta charset="UTF-8">
@@ -126,7 +186,7 @@ app.get('/qr', (req, res) => {
                         <div style="display: inline-block; width: 60px; height: 60px; border: 6px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 1s linear infinite;"></div>
                     </div>
                     <script>
-                        setTimeout(() => location.reload(), 3000);
+                        setTimeout(() => location.reload(), 5000);
                     </script>
                     <style>
                         @keyframes spin {
@@ -139,6 +199,7 @@ app.get('/qr', (req, res) => {
     }
     
     res.send(`
+        <!DOCTYPE html>
         <html>
             <head>
                 <meta charset="UTF-8">
@@ -161,23 +222,53 @@ app.get('/qr', (req, res) => {
                             <li>Toca <strong>⋮</strong> o <strong>Configuración</strong></li>
                             <li>Selecciona <strong>Dispositivos vinculados</strong></li>
                             <li>Toca <strong>"Vincular dispositivo"</strong></li>
-                            <li><strong>Escanea este código QR</strong> ☝️</li>
+                            <li><strong>Escanea este código QR AHORA</strong> ☝️</li>
                         </ol>
                     </div>
                     
-                    <p style="margin-top: 40px; opacity: 0.7; font-size: 0.9em;">
-                        ⚠️ Este QR expira en 20 segundos<br>
-                        La página se recargará automáticamente cada 15 segundos
-                    </p>
+                    <div style="margin-top: 30px; padding: 20px; background: rgba(255,0,0,0.2); border-radius: 10px; border: 2px solid rgba(255,255,255,0.3);">
+                        <p style="margin: 0; font-size: 1.1em; font-weight: bold;">⚠️ IMPORTANTE</p>
+                        <p style="margin: 10px 0 0 0;">Este QR expira en 60 segundos<br>
+                        <strong>¡Escanéalo de inmediato!</strong><br>
+                        La página NO se recargará automáticamente para darte tiempo</p>
+                    </div>
+                    
+                    <div style="margin-top: 20px;">
+                        <button onclick="location.reload()" style="background: rgba(255,255,255,0.2); border: 2px solid white; color: white; padding: 15px 30px; border-radius: 8px; cursor: pointer; font-size: 1em; font-weight: bold;">
+                            🔄 Recargar para nuevo QR
+                        </button>
+                    </div>
                 </div>
-                
-                <script>
-                    // Recargar cada 15 segundos para obtener un nuevo QR
-                    setTimeout(() => location.reload(), 15000);
-                </script>
             </body>
         </html>
     `);
+});
+
+// Endpoint para forzar reconexión manual
+app.post('/reconnect', (req, res) => {
+    if (isConnecting) {
+        return res.json({ 
+            success: false,
+            message: 'Ya hay una conexión en proceso'
+        });
+    }
+    
+    if (isConnected) {
+        return res.json({ 
+            success: false,
+            message: 'WhatsApp ya está conectado'
+        });
+    }
+    
+    console.log('🔄 Reconexión manual solicitada');
+    qrRetries = 0;
+    currentQR = null;
+    connectToWhatsApp();
+    
+    res.json({ 
+        success: true,
+        message: 'Reconexión iniciada. Ve a /qr para ver el código'
+    });
 });
 
 app.get('/', (req, res) => {
@@ -186,13 +277,15 @@ app.get('/', (req, res) => {
         status: 'online',
         whatsapp: isConnected ? 'connected' : 'disconnected',
         connecting: isConnecting,
+        qr_retries: qrRetries,
         message: isConnected 
             ? '✅ WhatsApp conectado y funcionando' 
             : isConnecting 
-                ? '🔄 Conectando a WhatsApp...'
+                ? '🔄 Conectando a WhatsApp... Ve a /qr'
                 : '⚠️ WhatsApp desconectado. Ve a /qr para conectar',
         timestamp: new Date().toISOString(),
-        qr_url: '/qr'
+        qr_url: '/qr',
+        reconnect_url: '/reconnect'
     });
 });
 
@@ -201,6 +294,7 @@ app.get('/health', (req, res) => {
         status: 'healthy',
         uptime: Math.floor(process.uptime()),
         whatsapp_connected: isConnected,
+        whatsapp_connecting: isConnecting,
         timestamp: new Date().toISOString()
     });
 });
@@ -322,6 +416,6 @@ app.listen(PORT, () => {
     console.log(`📊 Estado: https://whatsapp-sabor-paisa2.onrender.com/`);
     console.log(`👥 Grupos: https://whatsapp-sabor-paisa2.onrender.com/groups`);
     console.log('═══════════════════════════════════════════════════════');
-    console.log('🔄 Iniciando conexión a WhatsApp...');
-    connectToWhatsApp();
+    console.log('⏸️  Esperando solicitud manual en /qr para conectar');
+    console.log('💡 No se conectará automáticamente al iniciar');
 });
